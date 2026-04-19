@@ -46,11 +46,133 @@ class FullNode:
 
     ## Add code for part 1 here (You can make as many helper function you want)
     def verifyTransaction(self, Tx):
-        pass
+        """
+        Verifies a single transaction against UTXO_Database_Pending.
+
+        For COINBASE transactions  → unconditionally add outputs to the
+        pending UTXO set and return True.
+
+        For regular transactions:
+          1. Every input must reference a UTXO that exists in
+             UTXO_Database_Pending (proves funds are unspent).
+          2. The public key supplied in the input must hash to the
+             pubkey_hash recorded in that UTXO (proves ownership).
+          3. The RSA signature in each input must be valid (proves
+             authorisation). Transactions that fail #2 or #3 are added
+             to self.corrupt_transactions.
+          4. Sum(inputs) >= Sum(outputs)  (no money created from thin air;
+             any surplus is an implicit miner fee).
+
+        If all checks pass the spent UTXOs are removed and new output
+        UTXOs are inserted, then True is returned.
+        If any check fails, the UTXO set is left untouched and False is
+        returned.
+        """
+        # Ensure corrupt_transactions is a list so util.py can iterate it as
+        # a list of tx dicts. __init__ sets it to {} (dict); convert on first use.
+        if isinstance(self.corrupt_transactions, dict):
+            self.corrupt_transactions = list(self.corrupt_transactions.values())
+
+        # Already confirmed corrupt – skip immediately
+        if any(t['id'] == Tx['id'] for t in self.corrupt_transactions):
+            return False
+
+        # Lazy-init pubkey tracker (assignment forbids editing __init__)
+        if not hasattr(self, '_seen_pubkeys'):
+            self._seen_pubkeys = set()
+
+        # Coinbase
+        if Tx['COINBASE']:
+            # Reject duplicate coinbase transactions
+            if Tx['id'] in self.UTXO_Database_Pending:
+                return False
+            # Mark this coinbase as seen (duplicate-prevention marker)
+            self.UTXO_Database_Pending[Tx['id']] = True
+            # Add coinbase outputs to the pending UTXO set
+            for i, output in enumerate(Tx['outputs']):
+                value, pubkey_hash = output[0], output[1]
+                self._seen_pubkeys.add(pubkey_hash)
+                self.UTXO_Database_Pending[(Tx['id'], i)] = (value, pubkey_hash)
+            return True
+
+        # Regular transaction
+        total_input  = 0
+        total_output = 0
+        spent_utxos      = []       # keys to delete on success
+        spent_in_this_tx = set()    # detect intra-tx double-spend
+
+        for inp in Tx['inputs']:
+            prev_txn_id   = inp[0]
+            output_number = inp[1]
+            sig           = inp[2]
+            pubkey_rec    = inp[3]
+
+            utxo_key = (prev_txn_id, output_number)
+
+            # Guard: same UTXO referenced twice inside one transaction
+            if utxo_key in spent_in_this_tx:
+                return False
+
+            # Guard: UTXO must exist (not yet spent)
+            if utxo_key not in self.UTXO_Database_Pending:
+                return False
+
+            utxo_value, utxo_pubkey_hash = self.UTXO_Database_Pending[utxo_key]
+            self._seen_pubkeys.add(utxo_pubkey_hash)  # track even if about to be spent
+
+            # Guard: sender must own this UTXO
+            if hashPubKey(pubkey_rec) != utxo_pubkey_hash:
+                self.corrupt_transactions.append(Tx)
+                return False
+
+            # Guard: signature must be valid
+            # Protocol: finalString = str(parentHash) + ':' + str(currentHash)
+            # where parentHash = prevTxnId (already an int) and
+            # currentHash = SHA256 hash (as int) of the tx string excluding sigs
+            current_hash = calculateHash(stringifyTransactionExcludeSig(Tx))
+            final_string = str(prev_txn_id) + ':' + str(current_hash)
+            if not VerifySignature(final_string, sig, pubkey_rec):
+                self.corrupt_transactions.append(Tx)
+                return False
+
+            total_input += utxo_value
+            spent_utxos.append(utxo_key)
+            spent_in_this_tx.add(utxo_key)
+
+        for output in Tx['outputs']:
+            total_output += output[0]
+
+        # Guard: cannot spend more than you own
+        if total_input < total_output:
+            self.corrupt_transactions.append(Tx)
+            return False
+
+        for key in spent_utxos:
+            del self.UTXO_Database_Pending[key]
+
+        for i, output in enumerate(Tx['outputs']):
+            self._seen_pubkeys.add(output[1])
+            self.UTXO_Database_Pending[(Tx['id'], i)] = (output[0], output[1])
+
+        return True
 
     def findValidButUnconfirmedTransactions(self):
-        # find 5 valid transactions that are NOT in a block yet
-        pass
+        """
+        Iterate over all_unconfirmed_transactions and collect up to 5 that
+        pass verifyTransaction (which also updates UTXO_Database_Pending so
+        subsequent transactions see already-spent UTXOs correctly).
+
+        Results are stored in self.valid_but_unconfirmed_transactions (dict
+        keyed by transaction id).
+        """
+        self.valid_but_unconfirmed_transactions = {}
+        count = 0
+        for Tx in self.all_unconfirmed_transactions:
+            if count >= 5:
+                break
+            if self.verifyTransaction(Tx):
+                self.valid_but_unconfirmed_transactions[Tx['id']] = Tx
+                count += 1
 
 	## PART TWO - Mining and Proof-Of-Work ##
 	# Mine Blocks -- skip genesis block
@@ -90,7 +212,48 @@ class FullNode:
         """
         # Save block to physical memory here.
         # Syntax to store block: save_object(new_block,"valid_chain/block{}.block".format(new_block.index))
-        return
+        if update:
+            # Step 1 & 2: Rebuild UTXO from confirmed chain, copy to pending
+            self.update_UTXO()
+            self.UTXO_Database_Pending = copy.deepcopy(self.UTXO_Database)
+
+            # Step 3: Collect up to 5 valid unconfirmed transactions
+            self.findValidButUnconfirmedTransactions()
+
+            # Step 4: Assemble the candidate block
+            transactions  = list(self.valid_but_unconfirmed_transactions.values())
+            last          = self.last_block()
+            previous_hash = self.computeBlockHash(last)
+
+            self._pending_block = Block(
+                index         = last.index + 1,
+                transactions  = transactions,
+                time_stamp    = str(datetime.datetime.now()),
+                previous_hash = previous_hash,
+                miner         = self.STUDENT_ID,
+                nonce         = startingNonce,
+            )
+        else:
+            # Resume: just update the nonce on the already-built block
+            self._pending_block.nonce = startingNonce
+
+        # Step 5: Run proof of work
+        result_hash, nonce = self.proof_of_work(self._pending_block)
+
+        if result_hash == 0:
+            # Early exit – tell the caller what nonce to resume from
+            return nonce
+
+        # Step 6: Save the successfully mined block to disk and memory
+        save_object(
+            self._pending_block,
+            "valid_chain/block{}.block".format(self._pending_block.index),
+        )
+        self.valid_chain.append(self._pending_block)
+
+        # Step 7: Refresh the UTXO database to include the new block
+        self.update_UTXO()
+        return 0
 
     def proof_of_work(self, block):
         """
@@ -108,7 +271,20 @@ class FullNode:
         Returns: (hash_string, nonce)  on success
                  (0, nonce)            on early exit (limit reached, keep trying)
         """
-        pass
+        LIMIT = 100_000          # iterations before yielding control
+        prefix = '0' * self.DIFFICULTY
+        iterations = 0
+
+        computed_hash = self.computeBlockHash(block)
+
+        while not (computed_hash.startswith(prefix) and block.nonce % 10 == 0):
+            block.nonce += 1
+            computed_hash = self.computeBlockHash(block)
+            iterations += 1
+            if iterations >= LIMIT:
+                return (0, block.nonce)
+
+        return (computed_hash, block.nonce)
 
     def computeBlockHash(self, block):  # Compute the aggregate transaction hash.
         block_string = json.dumps(block.__dict__, sort_keys=True)
@@ -121,14 +297,47 @@ class FullNode:
         return Tx['number']
 
     def update_UTXO(self, till=-1):
-        # Update your UTXO database according to your VALID_CHAIN folder.
-        return
+        """
+        Rebuild self.UTXO_Database by replaying every transaction in
+        self.valid_chain up to block index `till` (exclusive; default = all).
+
+        After rebuilding, self.UTXO_Database_Pending is synchronised with a
+        deep copy of self.UTXO_Database so that subsequent verifyTransaction
+        calls start from a clean confirmed state.
+
+        UTXO entries have the form:
+            key  : (txn_id, output_index)   – uniquely identifies an output
+            value: (amount, pubkey_hash)     – who owns how much
+        """
+        self.UTXO_Database_Pending = {}
+        self._seen_pubkeys = set()  # reset tracking alongside pending UTXO
+        chain = sorted(self.valid_chain, key=self.sortHelper)
+
+        if till == -1:
+            till = len(chain)
+
+        # Skip genesis block (index 0) per assignment spec
+        for block in chain[1:till]:
+            for Tx in block.transactions:
+                self.verifyTransaction(Tx)
+
+        # Commit the pending snapshot as the confirmed UTXO database
+        self.UTXO_Database = copy.deepcopy(self.UTXO_Database_Pending)
 
     def showAccounts(self):
         """return a dictionary with mapping from pubkeyHash to total crypto available
 		Uses the PENDING UTXO database
 		"""
-        return
+        # Start with 0 for every pubkey we have ever seen (includes fully-spent users)
+        seen = getattr(self, '_seen_pubkeys', set())
+        accounts = {pkh: 0 for pkh in seen}
+        for key, val in self.UTXO_Database_Pending.items():
+            # Skip coinbase duplicate-prevention markers (key=int, val=True)
+            if not isinstance(key, tuple) or not isinstance(val, tuple):
+                continue
+            value, pubkey_hash = val
+            accounts[pubkey_hash] = accounts.get(pubkey_hash, 0) + value
+        return accounts
 
     ## PART TWO ##
 
@@ -207,7 +416,105 @@ class FullNode:
 		current_longest: your valid chain + temp_chain/new blocks your peer mined
 		last_block_hash: the hash of your last block
 		"""
-        return False
+        # Step 1: Length check 
+        if temp_chain[-1].index <= self.valid_chain[-1].index:
+            return False
+
+        # Step 2 & 3: Linkage and index continuity 
+        prev_hash      = last_block_hash
+        expected_index = temp_chain[0].index
+
+        for block in temp_chain:
+            if block.index != expected_index:
+                return False
+            if block.previous_hash != prev_hash:
+                return False
+            prev_hash = self.computeBlockHash(block)
+            expected_index += 1
+
+        # Step 3: Proof-of-Work 
+        prefix = '0' * self.DIFFICULTY
+        for block in temp_chain:
+            block_hash = self.computeBlockHash(block)
+            if not block_hash.startswith(prefix):
+                return False
+            if block.nonce % 10 != 0:
+                return False
+
+        # Step 4: Transaction validation with a local UTXO snapshot
+        # Build the UTXO from the agreed-upon prefix of current_longest
+        last_block_index = temp_chain[0].index - 1
+        temp_utxo = {}
+
+        for block in current_longest[1:last_block_index + 1]:  # skip genesis (index 0)
+            for Tx in block.transactions:
+                if Tx['COINBASE']:
+                    for i, output in enumerate(Tx['outputs']):
+                        temp_utxo[(Tx['id'], i)] = (output[0], output[1])
+                else:
+                    for inp in Tx['inputs']:
+                        temp_utxo.pop((inp[0], inp[1]), None)
+                    for i, output in enumerate(Tx['outputs']):
+                        temp_utxo[(Tx['id'], i)] = (output[0], output[1])
+
+        # Replay temp_chain transactions
+        seen_ids = set()
+
+        for block in temp_chain:
+            for Tx in block.transactions:
+                # No duplicate transaction IDs anywhere in the chain
+                if Tx['id'] in seen_ids:
+                    return False
+                seen_ids.add(Tx['id'])
+
+                if Tx['COINBASE']:
+                    for i, output in enumerate(Tx['outputs']):
+                        temp_utxo[(Tx['id'], i)] = (output[0], output[1])
+                    continue
+
+                # Regular transaction
+                total_input  = 0
+                total_output = 0
+                spent_keys   = []
+
+                for inp in Tx['inputs']:
+                    prev_txn_id   = inp[0]
+                    output_number = inp[1]
+                    sig           = inp[2]
+                    pubkey_rec    = inp[3]
+
+                    key = (prev_txn_id, output_number)
+
+                    if key not in temp_utxo:
+                        return False
+
+                    utxo_value, utxo_pubkey_hash = temp_utxo[key]
+
+                    if hashPubKey(pubkey_rec) != utxo_pubkey_hash:
+                        return False
+
+                    current_hash = calculateHash(stringifyTransactionExcludeSig(Tx))
+                    final_string = str(prev_txn_id) + ':' + str(current_hash)
+                    if not VerifySignature(final_string, sig, pubkey_rec):
+                        return False
+
+                    total_input += utxo_value
+                    spent_keys.append(key)
+
+                for output in Tx['outputs']:
+                    total_output += output[0]
+
+                if total_input < total_output:
+                    return False
+
+                # Commit this transaction to the local UTXO snapshot
+                for key in spent_keys:
+                    del temp_utxo[key]
+
+                for i, output in enumerate(Tx['outputs']):
+                    temp_utxo[(Tx['id'], i)] = (output[0], output[1])
+
+        return True
 
     def print_chain(self):
         """
